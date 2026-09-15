@@ -1599,6 +1599,13 @@ config_namespace! {
     ///
     /// [`SessionConfig`]: https://docs.rs/datafusion/latest/datafusion/prelude/struct.SessionConfig.html
     pub struct OptimizerOptions {
+        /// When set to true, the physical optimizer may preserve native
+        /// dictionary encoding for eligible string GROUP BY columns. The
+        /// optimization only applies when file metadata proves that all data
+        /// pages are dictionary encoded and exact cardinality and value-width
+        /// statistics satisfy conservative internal thresholds.
+        pub enable_dictionary_aggregation: bool, default = false
+
         /// When set to true, the optimizer will push a limit operation into
         /// grouped aggregations which have no aggregate expressions, as a soft limit,
         /// emitting groups once the limit is reached, before all rows in the group are read.

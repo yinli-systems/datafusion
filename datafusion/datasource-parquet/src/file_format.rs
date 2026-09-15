@@ -59,7 +59,9 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
-use crate::metadata::{DFParquetMetadata, lex_ordering_to_sorting_columns};
+use crate::metadata::{
+    DFParquetMetadata, lex_ordering_to_sorting_columns, physical_file_statistics,
+};
 use crate::reader::CachedParquetFileReaderFactory;
 use crate::source::{
     ParquetSource, parse_coerce_int96_string, parse_coerce_int96_tz_string,
@@ -495,9 +497,11 @@ impl FileFormat for ParquetFormat {
         )?;
         let ordering =
             crate::metadata::ordering_from_parquet_metadata(&metadata, &table_schema)?;
+        let physical_statistics = physical_file_statistics(&metadata, &table_schema);
         Ok(
             datafusion_datasource::file_format::FileMeta::new(statistics)
-                .with_ordering(ordering),
+                .with_ordering(ordering)
+                .with_physical_statistics(physical_statistics),
         )
     }
 

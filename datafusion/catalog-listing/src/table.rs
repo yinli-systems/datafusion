@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use datafusion_catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion_common::stats::{Precision, is_known_empty};
 use datafusion_common::{
-    Constraints, DFSchema, SchemaExt, Statistics, internal_datafusion_err, plan_err,
-    project_schema,
+    Constraints, DFSchema, PhysicalFileStatistics, SchemaExt, Statistics,
+    internal_datafusion_err, plan_err, project_schema,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
@@ -915,15 +915,24 @@ impl ListingTable {
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
-                let (statistics, ordering) = if ctx.config().collect_statistics() {
-                    self.do_collect_statistics_and_ordering(ctx, store, &part_file)
-                        .await?
-                } else {
-                    (Arc::new(Statistics::new_unknown(&self.file_schema)), None)
-                };
-                Ok(part_file
+                let (statistics, ordering, physical_statistics) =
+                    if ctx.config().collect_statistics() {
+                        self.do_collect_statistics_and_ordering(ctx, store, &part_file)
+                            .await?
+                    } else {
+                        (
+                            Arc::new(Statistics::new_unknown(&self.file_schema)),
+                            None,
+                            None,
+                        )
+                    };
+                let part_file = part_file
                     .with_statistics(statistics)
-                    .with_ordering(ordering))
+                    .with_ordering(ordering);
+                Ok(match physical_statistics {
+                    Some(statistics) => part_file.with_extension(statistics),
+                    None => part_file,
+                })
             })
             .boxed()
             .buffer_unordered(
@@ -1090,7 +1099,11 @@ impl ListingTable {
         ctx: &dyn Session,
         store: &Arc<dyn ObjectStore>,
         part_file: &PartitionedFile,
-    ) -> datafusion_common::Result<(Arc<Statistics>, Option<LexOrdering>)> {
+    ) -> datafusion_common::Result<(
+        Arc<Statistics>,
+        Option<LexOrdering>,
+        Option<PhysicalFileStatistics>,
+    )> {
         let path = TableScopedPath {
             table: part_file.table_reference.clone(),
             path: part_file.object_meta.location.clone(),
@@ -1105,7 +1118,11 @@ impl ListingTable {
             && cached.is_valid_for(meta, &self.file_schema_fingerprint)
         {
             // Return cached statistics and ordering
-            return Ok((Arc::clone(&cached.statistics), cached.ordering.clone()));
+            return Ok((
+                Arc::clone(&cached.statistics),
+                cached.ordering.clone(),
+                cached.physical_statistics.clone(),
+            ));
         }
 
         // Cache miss or invalid: fetch both statistics and ordering in a single metadata read
@@ -1126,11 +1143,16 @@ impl ListingTable {
                     Arc::clone(&self.file_schema_fingerprint),
                     Arc::clone(&statistics),
                     file_meta.ordering.clone(),
-                ),
+                )
+                .with_physical_statistics(file_meta.physical_statistics.clone()),
             );
         }
 
-        Ok((statistics, file_meta.ordering))
+        Ok((
+            statistics,
+            file_meta.ordering,
+            file_meta.physical_statistics,
+        ))
     }
 }
 

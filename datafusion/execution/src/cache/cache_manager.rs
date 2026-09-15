@@ -19,12 +19,15 @@ use crate::cache::default_cache::DefaultCache;
 pub use crate::cache::{Cache, CacheValue, SchemaFingerprint, TableScopedPath};
 use datafusion_common::HashMap;
 use datafusion_common::heap_size::{DFHeapSize, DFHeapSizeCtx};
-use datafusion_common::{Result, Statistics};
+use datafusion_common::{
+    PhysicalColumnStatistics, PhysicalFileStatistics, Result, Statistics,
+};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +106,8 @@ pub struct CachedFileMetadata {
     pub statistics: Arc<Statistics>,
     /// Cached ordering for the file.
     pub ordering: Option<LexOrdering>,
+    /// Cached physical per-column statistics for the file.
+    pub physical_statistics: Option<PhysicalFileStatistics>,
 }
 
 impl CachedFileMetadata {
@@ -118,7 +123,17 @@ impl CachedFileMetadata {
             schema_fingerprint,
             statistics,
             ordering,
+            physical_statistics: None,
         }
+    }
+
+    /// Attach physical per-column statistics to this cache entry.
+    pub fn with_physical_statistics(
+        mut self,
+        physical_statistics: Option<PhysicalFileStatistics>,
+    ) -> Self {
+        self.physical_statistics = physical_statistics;
+        self
     }
 
     /// Check if this cached entry is still valid for the given metadata.
@@ -151,6 +166,10 @@ impl DFHeapSize for CachedFileMetadata {
             + self.meta.e_tag.heap_size(ctx)
             + self.meta.location.as_ref().heap_size(ctx)
             + self.statistics.heap_size(ctx)
+            + self.physical_statistics.as_ref().map_or(0, |statistics| {
+                statistics.column_statistics.capacity()
+                    * size_of::<PhysicalColumnStatistics>()
+            })
         // Do not deep-count `schema_fingerprint`: each ListingTable shares one
         // fingerprint across all cached files.
         //TODO add ordering once LexOrdering/PhysicalExpr implements DFHeapSize

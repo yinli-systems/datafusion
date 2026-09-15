@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
-    ColumnStatistics, DataFusionError, HashMap, HashSet, Result, ScalarValue, Statistics,
-    internal_datafusion_err,
+    ColumnStatistics, DataFusionError, HashMap, HashSet, PhysicalColumnStatistics,
+    PhysicalFileStatistics, Result, ScalarValue, Statistics, internal_datafusion_err,
 };
 use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadata, FileMetadataCache,
@@ -43,7 +43,7 @@ use object_store::{ObjectMeta, ObjectStore};
 use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::{parquet_column, parquet_to_arrow_schema};
-use parquet::basic::{ColumnOrder, SortOrder, Type as PhysicalType};
+use parquet::basic::{ColumnOrder, Encoding, SortOrder, Type as PhysicalType};
 use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder, ParquetMetaDataReader,
     RowGroupMetaData, SortingColumn,
@@ -57,6 +57,63 @@ use std::sync::Arc;
 /// merged result to be `Inexact` rather than `Absent`, as the estimate
 /// would be too unreliable otherwise.
 const PARTIAL_NDV_THRESHOLD: f64 = 0.75;
+
+/// Extract physical column statistics used by scan-aware optimizations.
+///
+/// The dictionary flag is deliberately fail-closed: it is true only when every
+/// row group has a dictionary page and page-level encoding statistics prove
+/// that every data page uses a dictionary encoding. Older writers commonly omit
+/// one or both fields and therefore remain false.
+pub(crate) fn physical_file_statistics(
+    metadata: &ParquetMetaData,
+    logical_file_schema: &Schema,
+) -> PhysicalFileStatistics {
+    let schema_descr = metadata.file_metadata().schema_descr();
+    let top_level_columns: HashMap<&str, usize> = schema_descr
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            let parts = column.path().parts();
+            (parts.len() == 1).then_some((parts[0].as_str(), index))
+        })
+        .collect();
+
+    let column_statistics = logical_file_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let Some(&column_index) = top_level_columns.get(field.name().as_str()) else {
+                return PhysicalColumnStatistics::default();
+            };
+
+            let mut all_dictionary_encoded = !metadata.row_groups().is_empty();
+            let mut unencoded_value_bytes = Some(0usize);
+            for row_group in metadata.row_groups() {
+                let Some(column) = row_group.columns().get(column_index) else {
+                    return PhysicalColumnStatistics::default();
+                };
+                all_dictionary_encoded &= column.dictionary_page_offset().is_some()
+                    && column.page_encoding_stats_mask().is_some_and(|mask| {
+                        mask.is_only(Encoding::PLAIN_DICTIONARY)
+                            || mask.is_only(Encoding::RLE_DICTIONARY)
+                    });
+                unencoded_value_bytes = unencoded_value_bytes.and_then(|total| {
+                    usize::try_from(column.unencoded_byte_array_data_bytes()?)
+                        .ok()
+                        .and_then(|bytes| total.checked_add(bytes))
+                });
+            }
+
+            PhysicalColumnStatistics {
+                all_dictionary_encoded,
+                unencoded_value_bytes,
+            }
+        })
+        .collect();
+
+    PhysicalFileStatistics { column_statistics }
+}
 
 fn requires_unsigned_byte_array_order(column: &ColumnDescriptor) -> bool {
     matches!(
@@ -1279,6 +1336,108 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    mod physical_statistics_tests {
+        use super::*;
+        use parquet::basic::{EncodingMask, Type as PhysicalType};
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, RowGroupMetaData,
+        };
+        use parquet::schema::types::Type as SchemaType;
+
+        fn schema_descriptor() -> Arc<SchemaDescriptor> {
+            let field =
+                SchemaType::primitive_type_builder("value", PhysicalType::BYTE_ARRAY)
+                    .build()
+                    .unwrap();
+            let schema = SchemaType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(field)])
+                .build()
+                .unwrap();
+            Arc::new(SchemaDescriptor::new(Arc::new(schema)))
+        }
+
+        fn row_group(
+            schema: &Arc<SchemaDescriptor>,
+            encoding: Option<Encoding>,
+            unencoded_value_bytes: Option<i64>,
+        ) -> RowGroupMetaData {
+            let mut column = ColumnChunkMetaData::builder(schema.column(0))
+                .set_num_values(10)
+                .set_unencoded_byte_array_data_bytes(unencoded_value_bytes);
+            if let Some(encoding) = encoding {
+                column = column
+                    .set_dictionary_page_offset(Some(1))
+                    .set_page_encoding_stats_mask(EncodingMask::new_from_encodings(
+                        [&encoding].into_iter(),
+                    ));
+            }
+            RowGroupMetaData::builder(Arc::clone(schema))
+                .set_num_rows(10)
+                .set_total_byte_size(100)
+                .set_column_metadata(vec![column.build().unwrap()])
+                .build()
+                .unwrap()
+        }
+
+        fn make_metadata(row_groups: Vec<RowGroupMetaData>) -> ParquetMetaData {
+            let schema = schema_descriptor();
+            let file_metadata = FileMetaData::new(
+                1,
+                row_groups.iter().map(RowGroupMetaData::num_rows).sum(),
+                None,
+                None,
+                schema,
+                None,
+            );
+            ParquetMetaData::new(file_metadata, row_groups)
+        }
+
+        #[test]
+        fn requires_every_data_page_to_be_dictionary_encoded() {
+            let schema = schema_descriptor();
+            let logical_schema =
+                Schema::new(vec![Field::new("value", DataType::Utf8View, true)]);
+            let metadata = make_metadata(vec![
+                row_group(&schema, Some(Encoding::RLE_DICTIONARY), Some(160)),
+                row_group(&schema, Some(Encoding::PLAIN_DICTIONARY), Some(240)),
+            ]);
+
+            assert_eq!(
+                physical_file_statistics(&metadata, &logical_schema),
+                PhysicalFileStatistics {
+                    column_statistics: vec![PhysicalColumnStatistics {
+                        all_dictionary_encoded: true,
+                        unencoded_value_bytes: Some(400),
+                    }],
+                }
+            );
+
+            let metadata = make_metadata(vec![
+                row_group(&schema, Some(Encoding::RLE_DICTIONARY), Some(160)),
+                row_group(&schema, Some(Encoding::PLAIN), Some(240)),
+            ]);
+            assert!(
+                !physical_file_statistics(&metadata, &logical_schema).column_statistics
+                    [0]
+                .all_dictionary_encoded
+            );
+        }
+
+        #[test]
+        fn missing_footer_fields_fail_closed() {
+            let schema = schema_descriptor();
+            let logical_schema =
+                Schema::new(vec![Field::new("value", DataType::Utf8View, true)]);
+            let metadata = make_metadata(vec![row_group(&schema, None, None)]);
+            let statistics = physical_file_statistics(&metadata, &logical_schema);
+
+            assert_eq!(
+                statistics.column_statistics,
+                vec![PhysicalColumnStatistics::default()]
+            );
+        }
     }
 
     #[test]

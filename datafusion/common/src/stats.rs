@@ -382,6 +382,33 @@ pub struct Statistics {
     pub column_statistics: Vec<ColumnStatistics>,
 }
 
+/// Physical statistics for the columns stored in a single data file.
+///
+/// Unlike [`ColumnStatistics`], which describes the values produced by a plan,
+/// this metadata describes how a file stores those values. File formats can
+/// attach it to a [`PartitionedFile`](https://docs.rs/datafusion-datasource/latest/datafusion_datasource/struct.PartitionedFile.html)
+/// so scan-aware optimizers can make conservative format-specific decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalFileStatistics {
+    /// One entry for each column in the file schema.
+    pub column_statistics: Vec<PhysicalColumnStatistics>,
+}
+
+/// Physical statistics for one column stored in a data file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhysicalColumnStatistics {
+    /// Whether every data page containing this column is dictionary encoded.
+    ///
+    /// `false` also covers formats or writers that do not provide enough
+    /// metadata to prove this property.
+    pub all_dictionary_encoded: bool,
+    /// Total bytes occupied by variable-length values after decoding, excluding
+    /// offsets, validity data, and other array overhead.
+    ///
+    /// `None` means the file format or writer did not provide this information.
+    pub unencoded_value_bytes: Option<usize>,
+}
+
 /// Returns `true` when the statistics prove that the input contains no rows.
 ///
 /// Inexact or absent row counts are not sufficient to treat an input as empty.
